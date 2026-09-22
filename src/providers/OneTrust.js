@@ -93,7 +93,7 @@ class OneTrustProvider extends BaseProvider {
                 );
                 const guid = guidMatch ? guidMatch[1] : null;
                 return [
-                    { "key": "requestTypeParsed", "field": "Request Type", "value": isConfigFile ? "OneTrust Configuration" : "OneTrust Cookie Data", "group": "general" },
+                    { "key": "requestTypeParsed", "field": "Request Type", "value": isConfigFile ? "Configuration" : "Cookie Data", "group": "general" },
                     { "key": "_fetchEnrich", "value": "true", "hidden": true },
                     ...(guid ? [{ "key": "domainScriptId", "field": "Domain Script ID", "value": guid, "group": "general" }] : [])
                 ];
@@ -103,7 +103,7 @@ class OneTrustProvider extends BaseProvider {
         /* ---- Suppress everything else ---- */
         return [
             { "key": "_suppress", "value": "true", "hidden": true },
-            { "key": "requestTypeParsed", "field": "Request Type", "value": "OneTrust (suppressed)", "group": "general" }
+            { "key": "requestTypeParsed", "field": "Request Type", "value": "(suppressed)", "group": "general" }
         ];
     }
 
@@ -121,7 +121,7 @@ class OneTrustProvider extends BaseProvider {
     static parseConfigJson(json, guid) {
         const results = [];
 
-        results.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "OneTrust Configuration", "group": "general" });
+        results.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "Configuration", "group": "general" });
 
         if (guid)           { results.push({ "key": "domainScriptId", "field": "Domain Script ID", "value": guid,           "group": "general" }); }
         if (json.Domain)    { results.push({ "key": "domain",         "field": "Domain",           "value": json.Domain,     "group": "general" }); }
@@ -166,7 +166,7 @@ class OneTrustProvider extends BaseProvider {
         const dd = json.DomainData;
         if (!dd) { return { rows, purposeMap }; }
 
-        rows.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "OneTrust Cookie Data", "group": "general" });
+        rows.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "Cookie Data", "group": "general" });
 
         const culture = dd.Language && dd.Language.Culture;
         if (culture) {

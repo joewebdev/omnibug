@@ -17,7 +17,9 @@
  *     Shows category names (Targeting, Performance, etc.) mapped from PurposeId GUIDs,
  *     plus InteractionType, purposeIds, country, isAnonymous, type, test.
  *
- *  All other OneTrust traffic is suppressed.
+ *  All other OneTrust traffic is suppressed, including banner/preference-center
+ *  layout JSON (e.g. bLayout-en.json, pcLayout-en.json) — these carry pre-rendered
+ *  HTML/CSS for the widget UI, not consent data, so there's nothing to parse.
  *
  * @class
  * @extends BaseProvider
@@ -79,17 +81,23 @@ class OneTrustProvider extends BaseProvider {
             }];
         }
 
-        /* ---- OneTrust CDN JSON files ---- */
+        /* ---- OneTrust CDN JSON files (config + language only — layout/UI JSON falls through to suppression) ---- */
         if (/\.json$/i.test(pathname) && /\/consent\//i.test(pathname)) {
-            const guidMatch = pathname.match(
-                /\/(?:scripttemplates|consent)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
-            );
-            const guid = guidMatch ? guidMatch[1] : null;
-            return [
-                { "key": "requestTypeParsed", "field": "Request Type", "value": "OneTrust Config", "group": "general" },
-                { "key": "_fetchEnrich", "value": "true", "hidden": true },
-                ...(guid ? [{ "key": "domainScriptId", "field": "Domain Script ID", "value": guid, "group": "general" }] : [])
-            ];
+            const filename     = pathname.substring(pathname.lastIndexOf("/") + 1);
+            const isConfigFile = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:-test)?\.json$/i.test(filename);
+            const isLangFile   = /^[a-z]{2}(?:-[a-z]{2,4})?\.json$/i.test(filename);
+
+            if (isConfigFile || isLangFile) {
+                const guidMatch = pathname.match(
+                    /\/(?:scripttemplates|consent)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+                );
+                const guid = guidMatch ? guidMatch[1] : null;
+                return [
+                    { "key": "requestTypeParsed", "field": "Request Type", "value": isConfigFile ? "OneTrust Configuration" : "OneTrust Cookie Data", "group": "general" },
+                    { "key": "_fetchEnrich", "value": "true", "hidden": true },
+                    ...(guid ? [{ "key": "domainScriptId", "field": "Domain Script ID", "value": guid, "group": "general" }] : [])
+                ];
+            }
         }
 
         /* ---- Suppress everything else ---- */

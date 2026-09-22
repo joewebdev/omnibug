@@ -33,6 +33,7 @@
     "page": "options/options.html"
   },
   "permissions": [
+    "cookies",
     "storage",
     "webNavigation",
     "webRequest"

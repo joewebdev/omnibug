@@ -1,4 +1,4 @@
-/* global OmnibugSettings, OmnibugProvider, OmnibugPort */
+/* global OmnibugSettings, OmnibugProvider, OmnibugPort, OneTrustProvider */
 
 /**
  * Set/Load/Migrate settings when extension / browser is installed / updated.
@@ -41,13 +41,23 @@ var providerPattern;
 /*
  * Per-tab OneTrust state.
  *
- * configFetched  — prevents duplicate "OneTrust Configuration" panel entries
- *                  (OneTrust loads the config JSON 2-3x per page)
- * langFetched    — Set of language codes already shown (e.g. "en", "zh-cn")
- * purposeMap     — { [purposeId.toUpperCase()]: categoryName }
- *                  Populated when the lang JSON is parsed; used to label
- *                  consent receipt purposes with human-readable names like
- *                  "Targeting" instead of a raw GUID.
+ * configFetched     — prevents duplicate "OneTrust Configuration" panel entries
+ *                     (OneTrust loads the config JSON 2-3x per page)
+ * langFetched       — Set of language codes already shown (e.g. "en", "zh-cn")
+ * purposeMap        — { [purposeId.toUpperCase()]: categoryName }
+ *                     Populated when the lang JSON is parsed; used to label
+ *                     consent receipt purposes with human-readable names like
+ *                     "Targeting" instead of a raw GUID.
+ * groupIdMap        — { [CustomGroupId, e.g. "1"]: categoryName }
+ *                     Populated when the lang JSON is parsed; used to label
+ *                     OptanonConsent cookie groups (see groupIdMap above).
+ * hostname            — the tab's current top-level hostname, used to scope
+ *                       OptanonConsent cookie reads to this tab.
+ * lastOptanonValue    — last-posted OptanonConsent cookie value, so we don't
+ *                       re-post an identical "Consent Preferences" row.
+ * pendingOptanonValue — most recent cookie value seen, awaiting the debounce
+ *                       timer below (see scheduleOnetrustCookiePost).
+ * optanonDebounceTimer — timer id for the pending debounced post.
  *
  * Reset on each top-level navigation.
  */
@@ -55,9 +65,14 @@ const oneTrustFetchState = {};
 
 function resetOneTrustState(tabId) {
     oneTrustFetchState[tabId] = {
-        configFetched: false,
-        langFetched:   new Set(),
-        purposeMap:    {}
+        configFetched:        false,
+        langFetched:          new Set(),
+        purposeMap:           {},
+        groupIdMap:           {},
+        hostname:             null,
+        lastOptanonValue:     null,
+        pendingOptanonValue:  null,
+        optanonDebounceTimer: null
     };
 }
 
@@ -257,11 +272,14 @@ function enrichOneTrustJson(data, providerData, tabId) {
             const hasConfigShape = json.RuleSet && json.Domain;
 
             if (hasLangShape) {
-                /* parseLangJson returns { rows, purposeMap } */
+                /* parseLangJson returns { rows, purposeMap, groupIdMap } */
                 const result = OneTrustProvider.parseLangJson(json);
                 enrichedRows = result.rows;
-                /* Cache the purposeMap for consent receipt decoding */
+                /* Cache the ID→name maps for receipt and cookie decoding */
                 Object.assign(state.purposeMap, result.purposeMap);
+                Object.assign(state.groupIdMap, result.groupIdMap);
+                /* Re-check the cookie now that we can resolve category names from it */
+                checkOnetrustCookie(tabId);
             } else if (hasConfigShape) {
                 const guid = guidMatch ? guidMatch[1] : null;
                 enrichedRows = OneTrustProvider.parseConfigJson(json, guid);
@@ -322,12 +340,134 @@ chrome.webNavigation.onCommitted.addListener(
 
         resetOneTrustState(details.tabId);
 
+        try {
+            oneTrustFetchState[details.tabId].hostname = new URL(details.url).hostname;
+        } catch (e) { /* non-http(s) URL — no cookie to read */ }
+
+        /*
+         * The OptanonConsent cookie is written by otSDKStub.js almost immediately,
+         * but before any script has run at document-commit time. chrome.cookies.onChanged
+         * (registered below) catches it as soon as it's written; this delayed read is a
+         * fallback for the case where the cookie's value is byte-identical to a prior
+         * navigation's (so no change event fires) yet Omnibug was just reopened/reset.
+         */
+        setTimeout(() => checkOnetrustCookie(details.tabId), 1000);
+
         tabs[details.tabId].postMessage({
             "request": { "tab": details.tabId, "timestamp": details.timeStamp, "url": details.url },
             "event": "webNavigation"
         });
     }
 );
+
+/**
+ * The OneTrustProvider instance, used only to build the "provider" metadata
+ * block for the synthetic "Consent Preferences" cookie-derived panel entry
+ * (see postOnetrustCookieRow) — this entry doesn't originate from a webRequest.
+ */
+const oneTrustProviderInstance = new OneTrustProvider();
+
+/**
+ * Read the OptanonConsent cookie for a tab's current hostname and, if present,
+ * schedule it to be shown (see scheduleOnetrustCookiePost).
+ *
+ * @param {number} tabId
+ */
+function checkOnetrustCookie(tabId) {
+    const state = oneTrustFetchState[tabId];
+    if (!state || !state.hostname || !(tabId in tabs)) { return; }
+
+    chrome.cookies.get({ "url": `https://${state.hostname}/`, "name": "OptanonConsent" }, (cookie) => {
+        if (chrome.runtime.lastError || !cookie || !cookie.value) { return; }
+        scheduleOnetrustCookiePost(tabId, cookie.value);
+    });
+}
+
+/*
+ * OneTrust's own scripts rewrite the OptanonConsent cookie several times in
+ * quick succession during page init (GPC detection, geolocation, default
+ * category state, etc.) — each rewrite is a genuinely different string, so
+ * reacting to every chrome.cookies.onChanged event floods the panel with
+ * rows for the same visit. Debounce: wait for writes to go quiet before
+ * showing the settled value. A later, isolated change (e.g. a preference
+ * center save) is outside this window and still posts immediately.
+ */
+const ONETRUST_COOKIE_DEBOUNCE_MS = 600;
+let onetrustCookieRequestCounter = 0;
+
+/**
+ * Debounce a burst of OptanonConsent cookie writes down to a single post of
+ * the settled value.
+ *
+ * @param {number} tabId
+ * @param {string} cookieValue
+ */
+function scheduleOnetrustCookiePost(tabId, cookieValue) {
+    const state = oneTrustFetchState[tabId];
+    if (!state) { return; }
+
+    state.pendingOptanonValue = cookieValue;
+    clearTimeout(state.optanonDebounceTimer);
+    state.optanonDebounceTimer = setTimeout(() => {
+        postOnetrustCookieRow(tabId, state.pendingOptanonValue);
+    }, ONETRUST_COOKIE_DEBOUNCE_MS);
+}
+
+/**
+ * Parse an OptanonConsent cookie value and post it as a "Consent Preferences"
+ * panel entry, deduplicated against the last value posted for this navigation.
+ *
+ * @param {number} tabId
+ * @param {string} cookieValue
+ */
+function postOnetrustCookieRow(tabId, cookieValue) {
+    const state = oneTrustFetchState[tabId];
+    if (!state || state.lastOptanonValue === cookieValue || !(tabId in tabs)) { return; }
+    state.lastOptanonValue = cookieValue;
+
+    const rows = OneTrustProvider.parseOptanonCookie(cookieValue, state.groupIdMap);
+
+    tabs[tabId].postMessage({
+        "request": {
+            "initiator": null,
+            "method":    "COOKIE",
+            "id":        `onetrust-cookie-${++onetrustCookieRequestCounter}`,
+            "tab":       tabId,
+            "timestamp": Date.now(),
+            "type":      "other",
+            "url":       `https://${state.hostname}/`,
+            "postData":  "",
+            "postError": false
+        },
+        "event": "webRequest",
+        "provider": {
+            "name":    oneTrustProviderInstance.name,
+            "key":     oneTrustProviderInstance.key,
+            "type":    oneTrustProviderInstance.type,
+            "columns": oneTrustProviderInstance.columnMapping,
+            "groups":  oneTrustProviderInstance.groups
+        },
+        "data": rows.filter(d => !d.key.startsWith("_"))
+    });
+}
+
+/**
+ * Live updates to the OptanonConsent cookie — e.g. the user opens the
+ * preference center and changes categories after the initial page load.
+ */
+chrome.cookies.onChanged.addListener((changeInfo) => {
+    if (changeInfo.removed || changeInfo.cookie.name !== "OptanonConsent") { return; }
+
+    const cookieDomain = changeInfo.cookie.domain.replace(/^\./, "");
+    Object.keys(tabs).forEach((tabIdStr) => {
+        const tabId = Number(tabIdStr);
+        const state = oneTrustFetchState[tabId];
+        if (state && state.hostname &&
+            (state.hostname === cookieDomain || state.hostname.endsWith(`.${cookieDomain}`))) {
+            scheduleOnetrustCookiePost(tabId, changeInfo.cookie.value);
+        }
+    });
+});
 
 function validProviderRequest(details) {
     if (typeof providerPattern === "undefined" || !(providerPattern instanceof RegExp)) {

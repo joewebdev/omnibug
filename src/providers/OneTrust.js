@@ -9,12 +9,19 @@
  *     Groups: General, Template & Rules
  *   - "OneTrust Cookie Data" — from the language JSON (en.json etc.)
  *     Groups: General, Template & Rules
- *     Also caches the PurposeId → category name map for use by consent receipts.
+ *     Also caches the PurposeId → name map (receipts) and CustomGroupId → name
+ *     map (OptanonConsent cookie) for use by the two "Consent Preferences" sources below.
  *
- *  On page load AND when the user saves preferences:
+ *  On every page load (read directly from the OptanonConsent cookie, not a request):
+ *   - "Consent Preferences" — per-category name/ID/Allowed rows, decoded from the
+ *     cookie's groups=<CustomGroupId>:<0|1> field. Guaranteed to appear even when
+ *     OneTrust never POSTs a receipt (e.g. no decision has been made yet).
+ *     Re-emitted whenever the cookie value changes (e.g. preference center save).
+ *
+ *  On page load AND when the user saves preferences (if a receipt POST occurs):
  *   - "Consent Preferences" — from the POST to privacyportal.onetrust.com
  *     Groups: General, Consent Preferences
- *     Shows category names (Targeting, Performance, etc.) mapped from PurposeId GUIDs,
+ *     Shows category names (Targeting, Performance, etc.) + PurposeId GUIDs,
  *     plus InteractionType, purposeIds, country, isAnonymous, type, test.
  *
  *  All other OneTrust traffic is suppressed, including banner/preference-center
@@ -153,18 +160,21 @@ class OneTrustProvider extends BaseProvider {
 
     /**
      * Parse the OneTrust language JSON (e.g. en.json, zh-cn.json).
-     * Returns both display rows AND a purposeMap for receipt decoding.
+     * Returns display rows plus two ID→name maps used to decode consent data
+     * that arrives elsewhere keyed only by ID.
      *
      * @param  {object} json   Parsed JSON object
-     * @returns {{ rows: Array, purposeMap: object }}
+     * @returns {{ rows: Array, purposeMap: object, groupIdMap: object }}
      *   rows       — Omnibug data rows for the panel
-     *   purposeMap — { [purposeId: string]: categoryName: string }
+     *   purposeMap — { [purposeId GUID]: categoryName } — for consent receipt POSTs
+     *   groupIdMap — { [CustomGroupId, e.g. "1"]: categoryName } — for the OptanonConsent cookie
      */
     static parseLangJson(json) {
         const rows = [];
         const purposeMap = {};
+        const groupIdMap = {};
         const dd = json.DomainData;
-        if (!dd) { return { rows, purposeMap }; }
+        if (!dd) { return { rows, purposeMap, groupIdMap }; }
 
         rows.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "Cookie Data", "group": "general" });
 
@@ -187,11 +197,14 @@ class OneTrustProvider extends BaseProvider {
         if (typeof dd.ForceConsent !== "undefined")               { rows.push({ "key": "forceConsent",   "field": "Force Consent",       "value": dd.ForceConsent ? "Yes" : "No",                     "group": "template" }); }
         if (typeof dd.IsConsentLoggingEnabled !== "undefined")    { rows.push({ "key": "consentLogging", "field": "Consent Logging",     "value": dd.IsConsentLoggingEnabled ? "Enabled" : "Disabled", "group": "template" }); }
 
-        /* Build PurposeId → category name map for consent receipt decoding */
+        /* Build ID → category name maps for consent decoding elsewhere */
         const groups = Array.isArray(dd.Groups) ? dd.Groups : [];
         groups.forEach((group) => {
             if (group.PurposeId && group.GroupName) {
                 purposeMap[group.PurposeId.toUpperCase()] = group.GroupName;
+            }
+            if (group.CustomGroupId && group.GroupName) {
+                groupIdMap[group.CustomGroupId] = group.GroupName;
             }
         });
 
@@ -199,7 +212,7 @@ class OneTrustProvider extends BaseProvider {
         // Data: json.DomainData.Groups[n].FirstPartyCookies + Groups[n].Hosts[n].Cookies
         // Tabled pending memory/performance evaluation (Christie's has 223+ cookies).
 
-        return { rows, purposeMap };
+        return { rows, purposeMap, groupIdMap };
     }
 
     /**
@@ -247,11 +260,11 @@ class OneTrustProvider extends BaseProvider {
         purposes.forEach((p, idx) => {
             if (!p || !p.id) { return; }
             const purposeId  = p.id.toUpperCase();
-            const catName    = (purposeMap && purposeMap[purposeId]) || p.id;
+            const catName    = (purposeMap && purposeMap[purposeId]) || "(unknown category)";
             const statusText = statusLabels[p.status] || p.status || "(unknown)";
             results.push({
                 "key":   `purpose_${idx}`,
-                "field": catName,
+                "field": `${catName} (${purposeId})`,
                 "value": statusText,
                 "group": "consent"
             });
@@ -292,6 +305,73 @@ class OneTrustProvider extends BaseProvider {
         /* test flag */
         if (typeof receipt.test !== "undefined") {
             results.push({ "key": "test", "field": "test", "value": String(receipt.test), "group": "consent" });
+        }
+
+        return results;
+    }
+
+    /**
+     * Parse the client-side OptanonConsent cookie into consent preference rows.
+     *
+     * Read directly from the browser (not a network request) so a "Consent
+     * Preferences" entry is guaranteed on every page load — OneTrust only POSTs
+     * a consent receipt when a decision is made or replayed, but this cookie is
+     * written by otSDKStub.js immediately, before any network activity.
+     *
+     * Cookie value shape (application/x-www-form-urlencoded):
+     *   groups=3:0,2:0,1:1,4:0&interactionCount=2&geolocation=US;NY&consentId=...&datestamp=...
+     *   Each "groups" entry is "<CustomGroupId>:<0|1>" (0 = not allowed, 1 = allowed).
+     *
+     * @param  {string} cookieValue  Raw OptanonConsent cookie value
+     * @param  {object} groupIdMap   { [CustomGroupId]: categoryName } from parseLangJson
+     * @returns {Array}              Omnibug data rows
+     */
+    static parseOptanonCookie(cookieValue, groupIdMap) {
+        const results = [];
+        const params = new URLSearchParams(cookieValue);
+
+        results.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "Consent Preferences", "group": "general" });
+
+        /*
+         * The panel always sorts a group's rows alphabetically by field name
+         * (numeric-aware — see panel.js), with no insertion-order option. A
+         * leading "<id>. " puts categories in numerical order while still
+         * surfacing each category ID (digits sort before letters, so these
+         * fall before Interaction Count).
+         */
+        const interactionCount = params.get("interactionCount");
+        if (interactionCount) {
+            results.push({ "key": "interactionCount", "field": "Interaction Count", "value": interactionCount, "group": "consent" });
+        }
+
+        const groupsRaw = params.get("groups");
+        if (groupsRaw) {
+            groupsRaw.split(",").forEach((pair, idx) => {
+                const [id, status] = pair.split(":");
+                if (!id) { return; }
+                const catName = (groupIdMap && groupIdMap[id]) || "(unknown category)";
+                results.push({
+                    "key":   `group_${idx}`,
+                    "field": `${id}. ${catName}`,
+                    "value": status === "1" ? "Allowed" : "Not Allowed",
+                    "group": "consent"
+                });
+            });
+        }
+
+        const geolocation = params.get("geolocation");
+        if (geolocation) {
+            results.push({ "key": "geolocation", "field": "Geolocation", "value": geolocation.replace(";", ", "), "group": "consent" });
+        }
+
+        const consentId = params.get("consentId");
+        if (consentId) {
+            results.push({ "key": "consentId", "field": "Consent ID", "value": consentId, "group": "consent" });
+        }
+
+        const datestamp = params.get("datestamp");
+        if (datestamp) {
+            results.push({ "key": "datestamp", "field": "Date Stamp", "value": datestamp, "group": "consent" });
         }
 
         return results;

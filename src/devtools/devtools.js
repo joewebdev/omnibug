@@ -30,7 +30,15 @@
                         queuedMessages.push(msg);
                     }
                 });
-                port.onDisconnect.addListener(connectPort);
+                port.onDisconnect.addListener(() => {
+                    port = null;
+                    // Reconnecting throws if the extension was reloaded/unloaded
+                    try {
+                        connectPort();
+                    } catch (e) {
+                        console.warn("devtools: unable to reconnect port", e);
+                    }
+                });
             }
             connectPort();
 
@@ -49,9 +57,19 @@
 
                 // Inject a reply mechanism into the caller
                 panelWindow.Omnibug.send_message = (...data) => {
-                    if(port && port.postMessage) {
-                        port.postMessage(data);
+                    // The port can be dead before onDisconnect fires, so reconnect and retry once
+                    for (let attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            if (!port) {
+                                connectPort();
+                            }
+                            port.postMessage(data);
+                            return;
+                        } catch (e) {
+                            port = null;
+                        }
                     }
+                    console.warn("devtools: unable to send message, port unavailable");
                 };
             };
             panel.onShown.addListener(listener);

@@ -308,6 +308,10 @@ const OneTrustBackground = (() => {
         handleProviderData(data, providerData, tabId) {
             if (!Array.isArray(providerData.data)) { return false; }
 
+            /* Noise (banner assets, geolocation, etc.) — drop it without posting */
+            if (providerData.data.some(d => d.key === "_suppress")) {
+                return true;
+            }
             if (providerData.data.some(d => d.key === "_parseReceipt")) {
                 handleConsentReceipt(data, providerData, tabId);
                 return true;

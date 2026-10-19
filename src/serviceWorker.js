@@ -129,15 +129,10 @@ chrome.webRequest.onBeforeRequest.addListener(
 
         providerDataArray.forEach(providerData => {
 
-            /* ---- Suppression ---- */
-            const isSuppressed = Array.isArray(providerData.data) &&
-                providerData.data.some(d => d.key === "_suppress");
-            if (isSuppressed) { return; }
-
-            /* ---- OneTrust: receipts and JSON configs need extra handling ---- */
+            // OneTrust: suppressed requests, receipts and JSON configs
             if (OneTrustBackground.handleProviderData(data, providerData, details.tabId)) { return; }
 
-            /* ---- Normal path ---- */
+            // Normal path
             tabs[details.tabId].postMessage(Object.assign({}, data, providerData));
         });
     },
@@ -190,6 +185,9 @@ chrome.webNavigation.onCommitted.addListener(
     (details) => {
         if (!tabHasOmnibugOpen(details.tabId) || details.frameId !== 0) { return; }
 
+        // OneTrust: reset per-navigation state
+        OneTrustBackground.onNavigation(details.tabId, details.url);
+
         const data = {
             "request": {
                 "tab": details.tabId,
@@ -216,6 +214,7 @@ function validProviderRequest(details) {
             tabHasOmnibugOpen(details.tabId) &&
             providerPattern.test(details.url) &&
             !/\/.well-known\//i.test(details.url);
+
 }
 
 /**

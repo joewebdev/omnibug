@@ -67,7 +67,7 @@ class OneTrustProvider extends BaseProvider {
      * URL-only parse — routes each request to the correct handling path.
      *
      *  - privacyportal.*  → signal _parseReceipt (service worker handles with POST body)
-     *  - /consent/*.json  → signal _fetchEnrich  (service worker fetches response body)
+     *  - /consent/*.json  → signal _fetchJson    (service worker fetches response body)
      *  - everything else  → signal _suppress
      */
     handleCustom(url, params) {
@@ -101,7 +101,7 @@ class OneTrustProvider extends BaseProvider {
                 const guid = guidMatch ? guidMatch[1] : null;
                 return [
                     { "key": "requestTypeParsed", "field": "Request Type", "value": isConfigFile ? "Configuration" : "Cookie Data", "group": "general" },
-                    { "key": "_fetchEnrich", "value": "true", "hidden": true },
+                    { "key": "_fetchJson", "value": "true", "hidden": true },
                     ...(guid ? [{ "key": "domainScriptId", "field": "Domain Script ID", "value": guid, "group": "general" }] : [])
                 ];
             }

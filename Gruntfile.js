@@ -470,6 +470,7 @@ module.exports = function (grunt) {
                     "./src/libs/OmnibugPort.js",
                     "./src/libs/OmnibugSettings.js",
                     "./src/providers.js",
+                    "./src/background/*.js",
                     "./src/serviceWorker.js"
                 ],
             }

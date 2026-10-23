@@ -7,10 +7,10 @@
  *  Page load (once each):
  *   - "OneTrust Configuration" — from the main config JSON (fd2193c8...-test.json)
  *     Groups: General, Template & Rules
- *   - "OneTrust Cookie Data" — from the language JSON (en.json etc.)
- *     Groups: General, Template & Rules
- *     Also caches the PurposeId → name map (receipts) and CustomGroupId → name
- *     map (OptanonConsent cookie) for use by the two "Consent Preferences" sources below.
+ *     The language JSON (en.json etc.) is fetched too and its rows (language, banner
+ *     layout, consent model, etc.) are merged into this same entry. It also caches the
+ *     PurposeId → name map (receipts) and CustomGroupId → name map (OptanonConsent
+ *     cookie) for use by the two "Consent Preferences" sources below.
  *
  *  On every page load (read directly from the OptanonConsent cookie, not a request):
  *   - "Consent Preferences" — per-category name/ID/Allowed rows, decoded from the
@@ -100,7 +100,7 @@ class OneTrustProvider extends BaseProvider {
                 );
                 const guid = guidMatch ? guidMatch[1] : null;
                 return [
-                    { "key": "requestTypeParsed", "field": "Request Type", "value": isConfigFile ? "Configuration" : "Cookie Data", "group": "general" },
+                    { "key": "requestTypeParsed", "field": "Request Type", "value": "Configuration", "group": "general" },
                     { "key": "_fetchJson", "value": "true", "hidden": true },
                     ...(guid ? [{ "key": "domainScriptId", "field": "Domain Script ID", "value": guid, "group": "general" }] : [])
                 ];
@@ -141,7 +141,7 @@ class OneTrustProvider extends BaseProvider {
 
         if (activeRule) {
             results.push({ "key": "templateName", "field": "Template Name",          "value": activeRule.TemplateName || "(none)", "group": "template" });
-            results.push({ "key": "rulesetName",  "field": "Ruleset Name",           "value": activeRule.Name         || "(none)", "group": "template" });
+            //results.push({ "key": "rulesetName",  "field": "Ruleset Name",           "value": activeRule.Name         || "(none)", "group": "template" });
             results.push({ "key": "ruleType",     "field": "Consent Type",           "value": activeRule.Type         || "(none)", "group": "template" });
 
             const lsp = activeRule.LanguageSwitcherPlaceholder;
@@ -150,8 +150,8 @@ class OneTrustProvider extends BaseProvider {
             }
         }
 
-        if (json.GeoRuleGroupName)                        { results.push({ "key": "geoRuleGroup",  "field": "Geo Rule Group",         "value": json.GeoRuleGroupName,                                "group": "template" }); }
-        if (json.PublisherCC)                             { results.push({ "key": "publisherCC",   "field": "Publisher Country Code", "value": json.PublisherCC,                                     "group": "template" }); }
+        if (json.GeoRuleGroupName)                        { results.push({ "key": "geoRuleGroup",  "field": "Geolocation Rule Group",         "value": json.GeoRuleGroupName,                                "group": "template" }); }
+        //if (json.PublisherCC)                             { results.push({ "key": "publisherCC",   "field": "Publisher Country Code", "value": json.PublisherCC,                                     "group": "template" }); }
         if (typeof json.IsSuppressBanner !== "undefined") { results.push({ "key": "suppressBanner","field": "Banner Suppressed",      "value": json.IsSuppressBanner ? "Yes" : "No",                 "group": "template" }); }
         if (typeof json.LanguageDetectionEnabled !== "undefined") { results.push({ "key": "langDetect", "field": "Language Detection", "value": json.LanguageDetectionEnabled ? "Enabled" : "Disabled", "group": "template" }); }
 
@@ -160,8 +160,9 @@ class OneTrustProvider extends BaseProvider {
 
     /**
      * Parse the OneTrust language JSON (e.g. en.json, zh-cn.json).
-     * Returns display rows plus two ID→name maps used to decode consent data
-     * that arrives elsewhere keyed only by ID.
+     * Returns display rows (merged into the Configuration entry by the service
+     * worker) plus two ID→name maps used to decode consent data that arrives
+     * elsewhere keyed only by ID.
      *
      * @param  {object} json   Parsed JSON object
      * @returns {{ rows: Array, purposeMap: object, groupIdMap: object }}
@@ -175,8 +176,6 @@ class OneTrustProvider extends BaseProvider {
         const groupIdMap = {};
         const dd = json.DomainData;
         if (!dd) { return { rows, purposeMap, groupIdMap }; }
-
-        rows.push({ "key": "requestTypeParsed", "field": "Request Type", "value": "Cookie Data", "group": "general" });
 
         const culture = dd.Language && dd.Language.Culture;
         if (culture) {
@@ -352,7 +351,7 @@ class OneTrustProvider extends BaseProvider {
                 const catName = (groupIdMap && groupIdMap[id]) || "(unknown category)";
                 results.push({
                     "key":   `group_${idx}`,
-                    "field": `${id}. ${catName}`,
+                    "field": `(Purpose ID: ${id}) ${catName}`,
                     "value": status === "1" ? "Allowed" : "Not Allowed",
                     "group": "consent"
                 });

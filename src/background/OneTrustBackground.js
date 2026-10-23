@@ -19,7 +19,13 @@ const OneTrustBackground = (() => {
      *
      * configFetched     — prevents duplicate "OneTrust Configuration" panel entries
      *                     (OneTrust loads the config JSON 2-3x per page)
-     * langFetched       — Set of language codes already shown (e.g. "en", "zh-cn")
+     * langFetched       — Set of language codes already fetched (e.g. "en", "zh-cn")
+     * langRows          — display rows from the first language JSON parsed; merged
+     *                     into the "OneTrust Configuration" entry
+     * pendingConfig     — { data, providerData, rows } for a parsed config JSON that
+     *                     is waiting for langRows before being posted
+     * pendingConfigTimer — timer id; posts the config alone if no language JSON
+     *                     arrives in time (see CONFIG_WAIT_MS)
      * purposeMap        — { [purposeId.toUpperCase()]: categoryName }
      *                     Populated when the lang JSON is parsed; used to label
      *                     consent receipt purposes with human-readable names like
@@ -34,6 +40,8 @@ const OneTrustBackground = (() => {
      * pendingOptanonValue — most recent cookie value seen, awaiting the debounce
      *                       timer below (see scheduleCookiePost).
      * optanonDebounceTimer — timer id for the pending debounced post.
+     * receiptExtras       — InteractionType/test rows from a consent receipt,
+     *                       appended to the next cookie entry (see postCookieRow).
      *
      * Reset on each top-level navigation.
      */
@@ -54,6 +62,13 @@ const OneTrustBackground = (() => {
     const COOKIE_DEBOUNCE_MS = 600;
     let cookieRequestCounter = 0;
 
+    /*
+     * The config and language JSON are separate requests that can finish in
+     * either order, but are shown as one "Configuration" entry. The config entry
+     * is held this long for the language rows before being posted without them.
+     */
+    const CONFIG_WAIT_MS = 3000;
+
     /**
      * The OneTrustProvider instance, used only to build the "provider" metadata
      * block for the synthetic "Consent Preferences" cookie-derived panel entry
@@ -62,15 +77,20 @@ const OneTrustBackground = (() => {
     const providerInstance = new OneTrustProvider();
 
     function resetState(tabId) {
+        if (state[tabId]) { clearTimeout(state[tabId].pendingConfigTimer); }
         state[tabId] = {
             configFetched:        false,
             langFetched:          new Set(),
+            langRows:             null,
+            pendingConfig:        null,
+            pendingConfigTimer:   null,
             purposeMap:           {},
             groupIdMap:           {},
             hostname:             null,
             lastOptanonValue:     null,
             pendingOptanonValue:  null,
-            optanonDebounceTimer: null
+            optanonDebounceTimer: null,
+            receiptExtras:        null
         };
     }
 
@@ -109,22 +129,50 @@ const OneTrustBackground = (() => {
             ];
         }
 
-        const finalProviderData = Object.assign({}, providerData, {
-            data: rows.filter(d => !d.key.startsWith("_"))
-        });
+        /* Standalone receipt entry — only used if the cookie can't be read */
+        const postReceiptEntry = () => {
+            tabState.receiptExtras = null;
+            const finalProviderData = Object.assign({}, providerData, {
+                data: rows.filter(d => !d.key.startsWith("_"))
+            });
 
-        if (tabId in tabs) {
-            tabs[tabId].postMessage(Object.assign({}, data, finalProviderData));
+            if (tabId in tabs) {
+                tabs[tabId].postMessage(Object.assign({}, data, finalProviderData));
+            }
+        };
+
+        /*
+         * The OptanonConsent cookie gives the full category table, so the receipt
+         * only contributes InteractionType and test; they are appended to the
+         * cookie entry (see postCookieRow) instead of posting a second entry.
+         */
+        tabState.receiptExtras = rows.filter(d => d.key === "interactionType" || d.key === "test");
+
+        if (!tabState.hostname) {
+            postReceiptEntry();
+            return;
         }
+
+        chrome.cookies.get({ "url": `https://${tabState.hostname}/`, "name": "OptanonConsent" }, (cookie) => {
+            if (chrome.runtime.lastError || !cookie || !cookie.value) {
+                postReceiptEntry();
+                return;
+            }
+            scheduleCookiePost(tabId, cookie.value);
+        });
     }
 
     /**
-     * Fetch a OneTrust JSON config or lang URL, parse it, and post the resulting
-     * panel entry. Deduplicates per navigation:
-     *  - Config JSON: only the first request per navigation is shown
-     *  - Lang JSON:   only the first request per language code per navigation is shown
+     * Fetch a OneTrust JSON config or lang URL and parse it. Deduplicates per
+     * navigation:
+     *  - Config JSON: only the first request per navigation is used
+     *  - Lang JSON:   only the first request per language code per navigation is used
      *
-     * Also caches the purposeMap and groupIdMap from the lang JSON so that
+     * The config JSON produces the "Configuration" panel entry; the first lang
+     * JSON's display rows are merged into it (see postConfigEntry). The lang JSON
+     * never gets an entry of its own.
+     *
+     * The lang JSON also caches the purposeMap and groupIdMap so that
      * subsequent consent receipt and cookie parses can use human-readable
      * category names.
      *
@@ -159,36 +207,42 @@ const OneTrustBackground = (() => {
                 return response.json();
             })
             .then(json => {
-                let rows;
-
                 const hasLangShape   = json.DomainData && Array.isArray(json.DomainData.Groups);
                 const hasConfigShape = json.RuleSet && json.Domain;
 
                 if (hasLangShape) {
                     /* parseLangJson returns { rows, purposeMap, groupIdMap } */
                     const result = OneTrustProvider.parseLangJson(json);
-                    rows = result.rows;
                     /* Cache the ID→name maps for receipt and cookie decoding */
                     Object.assign(tabState.purposeMap, result.purposeMap);
                     Object.assign(tabState.groupIdMap, result.groupIdMap);
+                    /* Only the first language's display rows are merged into Configuration */
+                    if (!tabState.langRows) { tabState.langRows = result.rows; }
                     /* Re-check the cookie now that we can resolve category names from it */
                     checkCookie(tabId);
+                    postConfigEntry(tabId, tabState);
                 } else if (hasConfigShape) {
-                    rows = OneTrustProvider.parseConfigJson(json, guidMatch ? guidMatch[1] : null);
+                    tabState.pendingConfig = {
+                        data,
+                        providerData,
+                        rows: OneTrustProvider.parseConfigJson(json, guidMatch ? guidMatch[1] : null)
+                    };
+                    if (tabState.langRows) {
+                        postConfigEntry(tabId, tabState);
+                    } else {
+                        tabState.pendingConfigTimer = setTimeout(() => postConfigEntry(tabId, tabState), CONFIG_WAIT_MS);
+                    }
                 } else {
                     throw new Error("Unrecognised OneTrust JSON structure");
-                }
-
-                const finalProviderData = Object.assign({}, providerData, {
-                    data: rows.filter(d => !d.key.startsWith("_"))
-                });
-
-                if (tabId in tabs) {
-                    tabs[tabId].postMessage(Object.assign({}, data, finalProviderData));
                 }
             })
             .catch(err => {
                 console.warn("OneTrust JSON fetch failed:", err.message, url);
+                if (isLangJson) {
+                    /* Nothing to show for a lang JSON; don't keep the config entry waiting */
+                    postConfigEntry(tabId, tabState);
+                    return;
+                }
                 /* Fallback: show basic entry with URL only */
                 const fallback = Object.assign({}, providerData, {
                     data: (providerData.data || []).filter(d => !d.key.startsWith("_"))
@@ -197,6 +251,29 @@ const OneTrustBackground = (() => {
                     tabs[tabId].postMessage(Object.assign({}, data, fallback));
                 }
             });
+    }
+
+    /**
+     * Post the held "Configuration" entry, with the lang JSON's rows appended if
+     * they are available. No-op if there is no held config entry.
+     *
+     * @param {number} tabId
+     * @param {object} tabState  State object the config entry was held on
+     */
+    function postConfigEntry(tabId, tabState) {
+        const pending = tabState.pendingConfig;
+        if (!pending) { return; }
+        clearTimeout(tabState.pendingConfigTimer);
+        tabState.pendingConfig = null;
+
+        const rows = pending.rows.concat(tabState.langRows || []);
+        const finalProviderData = Object.assign({}, pending.providerData, {
+            data: rows.filter(d => !d.key.startsWith("_"))
+        });
+
+        if (tabId in tabs) {
+            tabs[tabId].postMessage(Object.assign({}, pending.data, finalProviderData));
+        }
     }
 
     /**
@@ -242,10 +319,16 @@ const OneTrustBackground = (() => {
      */
     function postCookieRow(tabId, cookieValue) {
         const tabState = state[tabId];
-        if (!tabState || tabState.lastOptanonValue === cookieValue || !(tabId in tabs)) { return; }
+        if (!tabState || !(tabId in tabs)) { return; }
+
+        /* A receipt always produces an entry, even if the cookie value didn't change */
+        const receiptExtras = tabState.receiptExtras;
+        if (!receiptExtras && tabState.lastOptanonValue === cookieValue) { return; }
+        tabState.receiptExtras  = null;
         tabState.lastOptanonValue = cookieValue;
 
-        const rows = OneTrustProvider.parseOptanonCookie(cookieValue, tabState.groupIdMap);
+        const rows = OneTrustProvider.parseOptanonCookie(cookieValue, tabState.groupIdMap)
+            .concat(receiptExtras || []);
 
         tabs[tabId].postMessage({
             "request": {
